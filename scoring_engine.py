@@ -400,3 +400,163 @@ def compute_pabrai_auto_score(info: dict[str, Any]) -> dict[str, Any]:
             "정성 판단을 완전히 대체하지 않습니다."
         ),
     }
+
+
+# =========================================================
+# Pabrai2: question-level automatic proxy detail
+# =========================================================
+# Only questions that can be reasonably approximated from the quantitative
+# factors above are auto-scored. Unmapped questions remain NEEDS_QUALITATIVE.
+# This deliberately avoids inventing scores for management integrity, true moat
+# durability, personal biases, legal/regulatory specifics, etc.
+QUESTION_FACTOR_MAP = {
+    # Leverage
+    16: ["debt_to_equity", "net_debt_ebitda"],
+    17: ["net_debt_ebitda"],
+    18: ["cash_to_debt", "positive_fcf"],
+    22: ["debt_to_equity", "cash_to_debt"],
+    23: ["net_debt_ebitda", "positive_fcf"],
+    24: ["net_debt_ebitda", "cash_to_debt", "positive_fcf"],
+    30: ["debt_to_equity"],
+    34: ["current_ratio", "positive_fcf"],
+    38: ["cash_to_debt"],
+    40: ["debt_to_equity"],
+    42: ["current_ratio", "cash_to_debt", "positive_fcf"],
+    43: ["debt_to_equity"],
+    44: ["debt_to_equity", "net_debt_ebitda"],
+    45: ["current_ratio", "cash_to_debt", "positive_fcf"],
+
+    # Moat - quantitative proxies only
+    46: ["gross_margin", "operating_margin", "roe_moat"],
+    48: ["gross_margin", "operating_margin"],
+    49: ["revenue_growth", "operating_margin"],
+    53: ["gross_margin", "operating_margin"],
+    54: ["operating_margin", "roe_moat"],
+    55: ["gross_margin", "operating_margin"],
+    63: ["gross_margin", "operating_margin"],
+    70: ["fcf_margin"],
+    72: ["gross_margin"],
+    73: ["gross_margin"],
+    80: ["operating_margin", "fcf_margin", "roe_moat"],
+
+    # Management / Ownership - proxy only
+    83: ["insider_alignment"],
+    85: ["insider_alignment"],
+    86: ["roe_management", "earnings_growth"],
+    90: ["roe_management", "roa_management", "earnings_growth"],
+    91: ["earnings_growth"],
+    100: ["earnings_growth", "revenue_growth"],
+    110: ["roe_management", "earnings_growth"],
+
+    # Business Economics
+    111: ["gross_margin", "operating_margin", "roe_moat", "fcf_margin"],
+    112: ["revenue_growth"],
+    113: ["gross_margin", "operating_margin"],
+    114: ["gross_margin", "operating_margin"],
+    115: ["gross_margin", "operating_margin"],
+    116: ["roe_moat", "roa_moat"],
+    117: ["roe_moat", "earnings_growth"],
+    118: ["cash_conversion", "fcf_margin"],
+    119: ["fcf_margin"],
+    122: ["beta"],
+    123: ["beta", "operating_margin_business"],
+    124: ["gross_margin"],
+    127: ["gross_margin", "operating_margin_business"],
+    128: ["earnings_growth", "failure_profitability"],
+    129: ["operating_margin_business"],
+    130: ["positive_fcf", "fcf_margin"],
+    131: ["revenue_growth", "roe_moat"],
+    132: ["positive_fcf", "cash_to_debt"],
+
+    # Accounting
+    135: ["cash_conversion"],
+    136: ["cash_conversion"],
+    140: ["cash_conversion"],
+    142: ["cash_conversion"],
+    143: ["cash_conversion"],
+
+    # Valuation
+    153: ["pe", "ev_ebitda", "fcf_yield", "price_to_book"],
+    154: ["fcf_yield", "fcf_margin"],
+    155: ["pe", "ev_ebitda", "price_to_book"],
+    158: ["fcf_yield"],
+    161: ["pe", "ev_ebitda"],
+    163: ["pe", "ev_ebitda", "fcf_yield"],
+    165: ["net_debt_ebitda", "cash_to_debt"],
+    166: ["fcf_yield", "pe"],
+    170: ["fcf_yield", "net_debt_ebitda"],
+    171: ["fcf_yield", "pe", "ev_ebitda"],
+    172: ["fcf_yield", "pe"],
+    173: ["pe", "fcf_yield"],
+    174: ["pe", "fcf_yield"],
+
+    # External Risk proxy
+    186: ["beta"],
+
+    # Failure Points
+    204: ["failure_profitability", "failure_fcf", "net_debt_ebitda"],
+    205: ["failure_profitability", "net_debt_ebitda", "cash_to_debt"],
+    208: ["failure_profitability", "failure_fcf"],
+}
+
+
+def build_question_breakdown(questions, auto_result):
+    factor_rows = {
+        row["key"]: row
+        for row in auto_result.get("factors", [])
+    }
+
+    breakdown = []
+    covered_weight = 0.0
+
+    for question in questions:
+        qno = int(question["question_no"])
+        factor_keys = QUESTION_FACTOR_MAP.get(qno, [])
+        usable = []
+
+        for key in factor_keys:
+            row = factor_rows.get(key)
+            if row and row.get("score") is not None:
+                usable.append(row)
+
+        if usable:
+            score_100 = sum(float(r["score"]) for r in usable) / len(usable)
+            score_5 = round(score_100 / 20.0, 1)
+            status = "AUTO_PROXY"
+            weight = float(question.get("weight_pct") or 0)
+            covered_weight += weight
+            basis = " · ".join(
+                f"{r['label']} {float(r['score']):.0f}/100"
+                for r in usable
+            )
+        else:
+            score_100 = None
+            score_5 = None
+            status = "DATA_MISSING" if factor_keys else "NEEDS_QUALITATIVE"
+            basis = (
+                "연결된 정량 Factor의 데이터가 부족합니다."
+                if factor_keys
+                else "공개 재무수치만으로 신뢰성 있게 자동 채점하지 않는 문항입니다."
+            )
+
+        breakdown.append(
+            {
+                "question_no": qno,
+                "category": question.get("category"),
+                "source_grade": question.get("source_grade"),
+                "weight_pct": float(question.get("weight_pct") or 0),
+                "score_5": score_5,
+                "score_100": None if score_100 is None else round(score_100, 2),
+                "status": status,
+                "proxy_factors": factor_keys,
+                "basis": basis,
+            }
+        )
+
+    return {
+        "rows": breakdown,
+        "question_coverage_pct": round(covered_weight, 2),
+        "auto_scored_count": sum(1 for row in breakdown if row["status"] == "AUTO_PROXY"),
+        "qualitative_count": sum(1 for row in breakdown if row["status"] == "NEEDS_QUALITATIVE"),
+        "data_missing_count": sum(1 for row in breakdown if row["status"] == "DATA_MISSING"),
+    }
