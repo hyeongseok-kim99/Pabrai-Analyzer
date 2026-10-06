@@ -1,0 +1,46 @@
+name: Score all 703 companies now
+
+on:
+  workflow_dispatch:
+
+jobs:
+  score-all:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        shard: [0, 1, 2, 3]
+
+    env:
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      SUPABASE_SECRET_KEY: ${{ secrets.SUPABASE_SECRET_KEY }}
+      BATCH_SIZE: "9999"
+      REFRESH_DAYS: "30"
+      FORCE_REFRESH: "1"
+      SHARD_COUNT: "4"
+      SHARD_INDEX: ${{ matrix.shard }}
+      REQUEST_DELAY: "1.2"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Verify scoring files
+        run: |
+          test -f scoring_engine.py
+          test -f scripts/auto_score.py
+          python -m py_compile scoring_engine.py scripts/auto_score.py
+
+      - name: Score shard
+        run: python scripts/auto_score.py
