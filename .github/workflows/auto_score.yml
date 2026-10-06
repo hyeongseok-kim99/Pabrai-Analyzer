@@ -31,7 +31,6 @@ jobs:
         run: pip install -r requirements.txt
       - name: Verify scoring files
         run: |
-          pwd
           test -f scoring_engine.py
           test -f scripts/auto_score.py
           python -m py_compile scoring_engine.py scripts/auto_score.py
