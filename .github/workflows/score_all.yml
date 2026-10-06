@@ -1,28 +1,26 @@
-name: Auto score investment universe
+name: Score all 703 companies now
 
 on:
   workflow_dispatch:
-    inputs:
-      batch_size:
-        description: "Companies to score in this run"
-        required: false
-        default: "30"
-  schedule:
-    - cron: "17 * * * *"
 
 jobs:
-  auto-score:
+  score-all:
     runs-on: ubuntu-latest
-    timeout-minutes: 55
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        shard: [0, 1, 2, 3]
 
     env:
       SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
       SUPABASE_SECRET_KEY: ${{ secrets.SUPABASE_SECRET_KEY }}
-      BATCH_SIZE: ${{ github.event.inputs.batch_size || '30' }}
+      BATCH_SIZE: "9999"
       REFRESH_DAYS: "30"
-      FORCE_REFRESH: "0"
-      SHARD_COUNT: "1"
-      SHARD_INDEX: "0"
+      FORCE_REFRESH: "1"
+      SHARD_COUNT: "4"
+      SHARD_INDEX: ${{ matrix.shard }}
       REQUEST_DELAY: "1.2"
 
     steps:
@@ -44,5 +42,5 @@ jobs:
           test -f scripts/auto_score.py
           python -m py_compile scoring_engine.py scripts/auto_score.py
 
-      - name: Score next batch
+      - name: Score shard
         run: python scripts/auto_score.py
