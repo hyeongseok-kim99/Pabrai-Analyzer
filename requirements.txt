@@ -1,2 +1,4 @@
 streamlit
 supabase
+finance-datareader
+pandas
