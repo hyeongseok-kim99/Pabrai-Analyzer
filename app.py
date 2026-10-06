@@ -23,17 +23,6 @@ CORE_CATEGORIES = {
 
 SCORE_OPTIONS = ["미평가", "N/A", "0", "1", "2", "3", "4", "5"]
 
-DEFAULT_UNIVERSES = {
-    "KOSPI": {
-        "country": "South Korea",
-        "minimum_expected": 500,
-    },
-    "S&P500": {
-        "country": "USA",
-        "minimum_expected": 400,
-    },
-}
-
 
 # =========================================================
 # Supabase
@@ -50,423 +39,8 @@ supabase = get_supabase()
 
 
 # =========================================================
-# External market listings
+# Basic data helpers
 # =========================================================
-@st.cache_data(ttl=86400, show_spinner=False)
-def load_listing(listing_name):
-    """
-    Current symbol/company listing from FinanceDataReader.
-    Cached for 24 hours per Streamlit server process.
-    """
-    return fdr.StockListing(listing_name)
-
-
-def find_column(df, candidates):
-    for candidate in candidates:
-        if candidate in df.columns:
-            return candidate
-    return None
-
-
-def clean_text(value):
-    if value is None:
-        return None
-
-    try:
-        if pd.isna(value):
-            return None
-    except Exception:
-        pass
-
-    text = str(value).strip()
-    return text if text else None
-
-
-def listing_to_records(df, market, country):
-    symbol_col = find_column(
-        df,
-        ["Symbol", "Code", "Ticker"],
-    )
-    name_col = find_column(
-        df,
-        ["Name", "Company", "CompanyName"],
-    )
-
-    if not symbol_col or not name_col:
-        raise RuntimeError(
-            f"{market} 종목 목록에서 Symbol/Name 열을 찾지 못했습니다. "
-            f"현재 열: {list(df.columns)}"
-        )
-
-    records = []
-
-    for _, row in df.iterrows():
-        symbol = clean_text(row.get(symbol_col))
-        name = clean_text(row.get(name_col))
-
-        if not symbol or not name:
-            continue
-
-        if market == "KOSPI":
-            symbol = symbol.zfill(6)
-        else:
-            symbol = symbol.upper()
-
-        records.append(
-            {
-                "ticker": symbol,
-                "company_name": name,
-                "market": market,
-                "country": country,
-            }
-        )
-
-    return records
-
-
-# =========================================================
-# Company / universe helpers
-# =========================================================
-def get_company_count(market=None):
-    query = (
-        supabase
-        .table("companies")
-        .select("id", count="exact")
-    )
-
-    if market:
-        query = query.eq("market", market)
-
-    result = query.limit(1).execute()
-    return result.count or 0
-
-
-def get_existing_tickers(market):
-    result = (
-        supabase
-        .table("companies")
-        .select("ticker")
-        .eq("market", market)
-        .limit(1000)
-        .execute()
-    )
-
-    return {
-        str(row["ticker"]).upper()
-        for row in (result.data or [])
-        if row.get("ticker")
-    }
-
-
-def insert_company_records(records, batch_size=200):
-    if not records:
-        return 0
-
-    inserted = 0
-
-    for start in range(0, len(records), batch_size):
-        batch = records[start:start + batch_size]
-
-        (
-            supabase
-            .table("companies")
-            .insert(batch)
-            .execute()
-        )
-
-        inserted += len(batch)
-
-    return inserted
-
-
-def sync_universe(market):
-    if market not in DEFAULT_UNIVERSES:
-        raise ValueError(f"지원하지 않는 기본 종목군: {market}")
-
-    config = DEFAULT_UNIVERSES[market]
-    df = load_listing(market)
-
-    records = listing_to_records(
-        df,
-        market=market,
-        country=config["country"],
-    )
-
-    existing = get_existing_tickers(market)
-
-    missing = [
-        row
-        for row in records
-        if row["ticker"].upper() not in existing
-    ]
-
-    inserted = insert_company_records(missing)
-
-    return {
-        "market": market,
-        "source_count": len(records),
-        "existing_count": len(existing),
-        "inserted_count": inserted,
-        "final_count": len(existing) + inserted,
-    }
-
-
-def auto_seed_default_universes():
-    messages = []
-
-    for market, config in DEFAULT_UNIVERSES.items():
-        current_count = get_company_count(market)
-
-        if current_count < config["minimum_expected"]:
-            result = sync_universe(market)
-            messages.append(result)
-
-    return messages
-
-
-def get_company_by_ticker(ticker, preferred_markets=None):
-    query = (
-        supabase
-        .table("companies")
-        .select("*")
-        .eq("ticker", ticker)
-        .limit(20)
-        .execute()
-    )
-
-    rows = query.data or []
-
-    if not rows:
-        return None
-
-    if preferred_markets:
-        for market in preferred_markets:
-            for row in rows:
-                if row.get("market") == market:
-                    return row
-
-    return rows[0]
-
-
-def add_company_if_missing(record):
-    existing = get_company_by_ticker(
-        record["ticker"],
-        preferred_markets=[record.get("market")],
-    )
-
-    if existing:
-        return existing, False
-
-    result = (
-        supabase
-        .table("companies")
-        .insert(record)
-        .execute()
-    )
-
-    if not result.data:
-        raise RuntimeError("기업 추가 결과를 확인할 수 없습니다.")
-
-    return result.data[0], True
-
-
-def validate_symbol_input(raw_value):
-    value = raw_value.strip()
-
-    if not value:
-        return None, None, "종목코드 또는 Ticker를 입력해주세요."
-
-    if value.isdigit():
-        if len(value) != 6:
-            return (
-                None,
-                None,
-                "한국 종목코드는 정확히 6자리 숫자로 입력해주세요. 예: 005930",
-            )
-        return "KR", value, None
-
-    if re.fullmatch(r"[A-Za-z]+", value):
-        return "US", value.upper(), None
-
-    return (
-        None,
-        None,
-        "한국 기업은 6자리 숫자, 미국 기업은 영문자만 입력할 수 있습니다.",
-    )
-
-
-def lookup_external_company(region, ticker):
-    """
-    Korean input: search all KRX listings, allowing later KOSDAQ/KONEX additions.
-    U.S. input: search S&P500 first, then NASDAQ/NYSE/AMEX.
-    """
-    if region == "KR":
-        df = load_listing("KRX")
-        symbol_col = find_column(df, ["Symbol", "Code", "Ticker"])
-        name_col = find_column(df, ["Name", "Company", "CompanyName"])
-        market_col = find_column(df, ["Market", "Exchange"])
-
-        if not symbol_col or not name_col:
-            raise RuntimeError("KRX 종목 목록 형식을 확인할 수 없습니다.")
-
-        symbols = df[symbol_col].astype(str).str.zfill(6)
-        matched = df[symbols == ticker]
-
-        if matched.empty:
-            return None
-
-        row = matched.iloc[0]
-        market = clean_text(row.get(market_col)) if market_col else "KRX"
-
-        return {
-            "ticker": ticker,
-            "company_name": clean_text(row.get(name_col)),
-            "market": market or "KRX",
-            "country": "South Korea",
-        }
-
-    if region == "US":
-        for listing_name in ["S&P500", "NASDAQ", "NYSE", "AMEX"]:
-            df = load_listing(listing_name)
-            symbol_col = find_column(df, ["Symbol", "Code", "Ticker"])
-            name_col = find_column(df, ["Name", "Company", "CompanyName"])
-
-            if not symbol_col or not name_col:
-                continue
-
-            symbols = df[symbol_col].astype(str).str.upper()
-            matched = df[symbols == ticker]
-
-            if matched.empty:
-                continue
-
-            row = matched.iloc[0]
-
-            return {
-                "ticker": ticker,
-                "company_name": clean_text(row.get(name_col)),
-                "market": listing_name,
-                "country": "USA",
-            }
-
-    return None
-
-
-def resolve_company_from_input(raw_value, create_if_missing=True):
-    region, ticker, error = validate_symbol_input(raw_value)
-
-    if error:
-        return None, False, error
-
-    preferred = (
-        ["KOSPI", "KOSDAQ", "KONEX", "KRX"]
-        if region == "KR"
-        else ["S&P500", "NASDAQ", "NYSE", "AMEX"]
-    )
-
-    company = get_company_by_ticker(
-        ticker,
-        preferred_markets=preferred,
-    )
-
-    if company:
-        return company, False, None
-
-    try:
-        record = lookup_external_company(region, ticker)
-    except Exception as e:
-        return None, False, f"종목 정보 조회 중 오류가 발생했습니다: {e}"
-
-    if not record:
-        if region == "KR":
-            return (
-                None,
-                False,
-                f"{ticker} 종목을 KRX 상장사 목록에서 찾지 못했습니다.",
-            )
-
-        return (
-            None,
-            False,
-            f"{ticker} 종목을 지원하는 미국 상장사 목록에서 찾지 못했습니다.",
-        )
-
-    if not create_if_missing:
-        return record, False, None
-
-    try:
-        company, created = add_company_if_missing(record)
-        return company, created, None
-    except Exception as e:
-        return None, False, f"기업 저장 중 오류가 발생했습니다: {e}"
-
-
-def search_companies(search_term="", market="전체", limit=100):
-    term = search_term.strip()
-
-    def base_query():
-        query = (
-            supabase
-            .table("companies")
-            .select("id,ticker,company_name,market,country")
-        )
-
-        if market != "전체":
-            query = query.eq("market", market)
-
-        return query
-
-    if not term:
-        result = (
-            base_query()
-            .order("ticker")
-            .limit(limit)
-            .execute()
-        )
-        return result.data or []
-
-    ticker_result = (
-        base_query()
-        .ilike("ticker", f"%{term}%")
-        .limit(limit)
-        .execute()
-    )
-
-    name_result = (
-        base_query()
-        .ilike("company_name", f"%{term}%")
-        .limit(limit)
-        .execute()
-    )
-
-    combined = {}
-    for row in (ticker_result.data or []) + (name_result.data or []):
-        combined[row["id"]] = row
-
-    rows = list(combined.values())
-    rows.sort(
-        key=lambda x: (
-            str(x.get("ticker", "")),
-            str(x.get("company_name", "")),
-        )
-    )
-    return rows[:limit]
-
-
-# =========================================================
-# Analysis helpers
-# =========================================================
-def get_categories():
-    result = (
-        supabase
-        .table("categories")
-        .select("*")
-        .order("display_order")
-        .execute()
-    )
-    return result.data or []
-
-
 def get_questions():
     result = (
         supabase
@@ -479,7 +53,31 @@ def get_questions():
     return result.data or []
 
 
-def get_analyses(limit=200):
+def get_categories():
+    result = (
+        supabase
+        .table("categories")
+        .select("*")
+        .order("display_order")
+        .execute()
+    )
+    return result.data or []
+
+
+def get_company_by_ticker(ticker):
+    result = (
+        supabase
+        .table("companies")
+        .select("*")
+        .eq("ticker", ticker)
+        .limit(20)
+        .execute()
+    )
+    rows = result.data or []
+    return rows[0] if rows else None
+
+
+def get_analyses(limit=300):
     result = (
         supabase
         .table("analyses")
@@ -519,33 +117,28 @@ def get_next_version(company_id):
         .limit(1)
         .execute()
     )
-
     if not result.data:
         return 1
-
     return int(result.data[0]["version"]) + 1
 
 
 def create_analysis(company_id):
-    next_version = get_next_version(company_id)
-
+    version = get_next_version(company_id)
     result = (
         supabase
         .table("analyses")
         .insert(
             {
                 "company_id": company_id,
-                "version": next_version,
+                "version": version,
                 "analysis_date": str(date.today()),
                 "status": "DRAFT",
             }
         )
         .execute()
     )
-
     if not result.data:
         raise RuntimeError("분석 생성 결과를 확인할 수 없습니다.")
-
     return result.data[0]
 
 
@@ -578,7 +171,6 @@ def save_answer(
         "evidence": evidence.strip() if evidence else None,
         "evidence_url": evidence_url.strip() if evidence_url else None,
     }
-
     (
         supabase
         .table("answers")
@@ -602,13 +194,10 @@ def update_analysis(
 
     if total_score is not None:
         payload["total_score"] = round(float(total_score), 2)
-
     if status is not None:
         payload["status"] = status
-
     if decision is not None:
         payload["decision"] = decision
-
     if notes is not None:
         payload["notes"] = notes
 
@@ -623,42 +212,270 @@ def update_analysis(
 
 
 # =========================================================
-# Scoring helpers
+# Universe / auto-score helpers
+# =========================================================
+def get_active_universe():
+    result = (
+        supabase
+        .table("investment_universe")
+        .select(
+            """
+            company_id,
+            universe,
+            rank,
+            as_of,
+            companies (
+                id,
+                ticker,
+                company_name,
+                market,
+                country
+            )
+            """
+        )
+        .eq("is_active", True)
+        .limit(1000)
+        .execute()
+    )
+    return result.data or []
+
+
+def universe_counts(rows):
+    counts = {"KOSPI_TOP200": 0, "SP500": 0}
+    for row in rows:
+        key = row.get("universe")
+        if key in counts:
+            counts[key] += 1
+    return counts
+
+
+def search_universe(rows, term="", universe="전체"):
+    term = term.strip().lower()
+    filtered = []
+
+    for row in rows:
+        if universe != "전체" and row.get("universe") != universe:
+            continue
+
+        company = row.get("companies") or {}
+        ticker = str(company.get("ticker", "")).lower()
+        name = str(company.get("company_name", "")).lower()
+
+        if term and term not in ticker and term not in name:
+            continue
+
+        filtered.append(row)
+
+    filtered.sort(
+        key=lambda r: (
+            0 if r.get("universe") == "KOSPI_TOP200" else 1,
+            r.get("rank") or 999999,
+        )
+    )
+    return filtered
+
+
+def get_framework_scores(framework_id="PABRAI_AUTO"):
+    result = (
+        supabase
+        .table("framework_scores")
+        .select(
+            """
+            company_id,
+            framework_id,
+            total_score,
+            coverage_pct,
+            status,
+            as_of,
+            details,
+            companies (
+                ticker,
+                company_name,
+                market,
+                country
+            )
+            """
+        )
+        .eq("framework_id", framework_id)
+        .limit(1000)
+        .execute()
+    )
+    return result.data or []
+
+
+def get_frameworks():
+    result = (
+        supabase
+        .table("frameworks")
+        .select("*")
+        .eq("is_active", True)
+        .order("name")
+        .execute()
+    )
+    return result.data or []
+
+
+def get_framework_dimensions(framework_id):
+    result = (
+        supabase
+        .table("framework_dimensions")
+        .select("*")
+        .eq("framework_id", framework_id)
+        .order("display_order")
+        .execute()
+    )
+    return result.data or []
+
+
+# =========================================================
+# Manual/custom company lookup
+# =========================================================
+@st.cache_data(ttl=86400, show_spinner=False)
+def load_listing(name):
+    return fdr.StockListing(name)
+
+
+def _find_col(df, names):
+    for name in names:
+        if name in df.columns:
+            return name
+    return None
+
+
+def _clean(value):
+    if value is None:
+        return None
+    try:
+        if pd.isna(value):
+            return None
+    except Exception:
+        pass
+    text = str(value).strip()
+    return text or None
+
+
+def validate_symbol_input(raw_value):
+    value = raw_value.strip()
+
+    if not value:
+        return None, None, "종목코드 또는 Ticker를 입력해주세요."
+
+    if value.isdigit():
+        if len(value) != 6:
+            return None, None, "한국 종목코드는 정확히 6자리 숫자여야 합니다."
+        return "KR", value, None
+
+    if re.fullmatch(r"[A-Za-z]+", value):
+        return "US", value.upper(), None
+
+    return None, None, "한국은 6자리 숫자, 미국은 영문자만 입력할 수 있습니다."
+
+
+def lookup_external_company(region, ticker):
+    if region == "KR":
+        df = load_listing("KRX")
+        symbol_col = _find_col(df, ["Symbol", "Code", "Ticker"])
+        name_col = _find_col(df, ["Name", "Company", "CompanyName"])
+        market_col = _find_col(df, ["Market", "Exchange"])
+
+        if not symbol_col or not name_col:
+            raise RuntimeError("KRX 종목 목록 형식을 확인할 수 없습니다.")
+
+        symbols = df[symbol_col].astype(str).str.zfill(6)
+        matched = df[symbols == ticker]
+
+        if matched.empty:
+            return None
+
+        row = matched.iloc[0]
+        return {
+            "ticker": ticker,
+            "company_name": _clean(row.get(name_col)),
+            "market": _clean(row.get(market_col)) if market_col else "KRX",
+            "country": "South Korea",
+        }
+
+    for listing_name in ["S&P500", "NASDAQ", "NYSE", "AMEX"]:
+        df = load_listing(listing_name)
+        symbol_col = _find_col(df, ["Symbol", "Code", "Ticker"])
+        name_col = _find_col(df, ["Name", "Company", "CompanyName"])
+
+        if not symbol_col or not name_col:
+            continue
+
+        symbols = df[symbol_col].astype(str).str.upper()
+        matched = df[symbols == ticker]
+
+        if matched.empty:
+            continue
+
+        row = matched.iloc[0]
+        return {
+            "ticker": ticker,
+            "company_name": _clean(row.get(name_col)),
+            "market": listing_name,
+            "country": "USA",
+        }
+
+    return None
+
+
+def resolve_company(raw_value):
+    region, ticker, error = validate_symbol_input(raw_value)
+    if error:
+        return None, False, error
+
+    existing = get_company_by_ticker(ticker)
+    if existing:
+        return existing, False, None
+
+    try:
+        record = lookup_external_company(region, ticker)
+    except Exception as e:
+        return None, False, f"기업 정보 조회 오류: {e}"
+
+    if not record:
+        return None, False, f"{ticker} 종목을 찾지 못했습니다."
+
+    try:
+        result = (
+            supabase
+            .table("companies")
+            .insert(record)
+            .execute()
+        )
+        if not result.data:
+            raise RuntimeError("기업 저장 결과 없음")
+        return result.data[0], True, None
+    except Exception as e:
+        return None, False, f"기업 저장 오류: {e}"
+
+
+# =========================================================
+# Scoring helpers for manual 213 checklist
 # =========================================================
 def score_to_status(score_choice):
     if score_choice == "미평가":
         return None, "UNKNOWN"
-
     if score_choice == "N/A":
         return None, "N/A"
 
     score = int(score_choice)
 
     if score >= 4:
-        status = "PASS"
-    elif score >= 2:
-        status = "WARNING"
-    else:
-        status = "FAIL"
-
-    return score, status
+        return score, "PASS"
+    if score >= 2:
+        return score, "WARNING"
+    return score, "FAIL"
 
 
 def answer_to_score_choice(answer):
     if not answer:
         return "미평가"
-
-    status = answer.get("status")
-
-    if status == "N/A":
+    if answer.get("status") == "N/A":
         return "N/A"
-
     score = answer.get("score")
-
-    if score is None:
-        return "미평가"
-
-    return str(score)
+    return "미평가" if score is None else str(score)
 
 
 def build_answer_map(answers):
@@ -673,10 +490,8 @@ def calculate_summary(questions, answers):
 
     total_weighted = 0.0
     total_rated_weight = 0.0
-
     category_data = {}
     completed_count = 0
-    na_count = 0
     fail_count = 0
     warning_count = 0
     pass_count = 0
@@ -687,18 +502,18 @@ def calculate_summary(questions, answers):
         weight = float(question["weight_pct"])
         qno = int(question["question_no"])
 
-        if category not in category_data:
-            category_data[category] = {
+        category_data.setdefault(
+            category,
+            {
                 "weighted": 0.0,
                 "rated_weight": 0.0,
                 "completed_count": 0,
                 "total_count": 0,
-            }
-
+            },
+        )
         category_data[category]["total_count"] += 1
 
         answer = answer_map.get(qno)
-
         if not answer or answer.get("status") == "UNKNOWN":
             continue
 
@@ -706,11 +521,9 @@ def calculate_summary(questions, answers):
         category_data[category]["completed_count"] += 1
 
         if answer.get("status") == "N/A":
-            na_count += 1
             continue
 
         score = answer.get("score")
-
         if score is None:
             continue
 
@@ -719,12 +532,10 @@ def calculate_summary(questions, answers):
 
         total_weighted += weighted_value
         total_rated_weight += weight
-
         category_data[category]["weighted"] += weighted_value
         category_data[category]["rated_weight"] += weight
 
         status = answer.get("status")
-
         if status == "PASS":
             pass_count += 1
         elif status == "WARNING":
@@ -742,48 +553,29 @@ def calculate_summary(questions, answers):
             )
 
     overall_score = None
-
     if total_rated_weight > 0:
-        overall_score = (
-            total_weighted
-            / total_rated_weight
-            * 100.0
-        )
+        overall_score = total_weighted / total_rated_weight * 100.0
 
-    for _, data in category_data.items():
+    for data in category_data.values():
         if data["rated_weight"] > 0:
-            data["score"] = (
-                data["weighted"]
-                / data["rated_weight"]
-                * 100.0
-            )
+            data["score"] = data["weighted"] / data["rated_weight"] * 100.0
         else:
             data["score"] = None
 
     total_questions = len(questions)
-    unknown_count = max(
-        0,
-        total_questions - completed_count,
-    )
-
-    completion_pct = (
-        completed_count / total_questions * 100.0
-        if total_questions
-        else 0.0
-    )
+    unknown_count = max(0, total_questions - completed_count)
+    completion_pct = completed_count / total_questions * 100.0 if total_questions else 0.0
 
     return {
         "overall_score": overall_score,
         "category_data": category_data,
         "completed_count": completed_count,
-        "na_count": na_count,
         "unknown_count": unknown_count,
         "pass_count": pass_count,
         "warning_count": warning_count,
         "fail_count": fail_count,
         "core_zero_items": core_zero_items,
         "completion_pct": completion_pct,
-        "rated_weight_pct": total_rated_weight,
     }
 
 
@@ -792,135 +584,92 @@ def suggested_decision(summary):
 
     if score is None:
         return "REVIEW REQUIRED"
-
     if summary["core_zero_items"]:
         return "REVIEW REQUIRED"
-
     if score >= 80:
         return "GO"
-
     if score >= 65:
         return "WAIT"
-
     return "NO-GO"
 
 
-# =========================================================
-# UI helpers
-# =========================================================
 def analysis_label(analysis):
     company = analysis.get("companies") or {}
-    company_name = company.get("company_name", "-")
-    ticker = company.get("ticker", "-")
-    version = analysis.get("version", "-")
-    status = analysis.get("status", "-")
-
     return (
-        f"{company_name} ({ticker}) · "
-        f"V{version} · {status}"
+        f"{company.get('company_name', '-')} "
+        f"({company.get('ticker', '-')}) · "
+        f"V{analysis.get('version', '-')} · "
+        f"{analysis.get('status', '-')}"
     )
 
 
-def analysis_selector(
-    analyses,
-    key,
-    label="분석 선택",
-):
+def analysis_selector(analyses, key, label="분석 선택"):
     if not analyses:
         return None
 
-    analysis_by_label = {
+    mapping = {
         analysis_label(item): item
         for item in analyses
     }
+    labels = list(mapping.keys())
 
-    labels = list(analysis_by_label.keys())
-
-    preferred_id = st.session_state.get(
-        "current_analysis_id"
-    )
-
+    preferred_id = st.session_state.get("current_analysis_id")
     default_index = 0
 
     if preferred_id:
         for idx, label_text in enumerate(labels):
-            if analysis_by_label[label_text]["id"] == preferred_id:
+            if mapping[label_text]["id"] == preferred_id:
                 default_index = idx
                 break
 
-    selected_label = st.selectbox(
+    selected = st.selectbox(
         label,
         labels,
         index=default_index,
         key=key,
     )
-
-    return analysis_by_label[selected_label]
+    return mapping[selected]
 
 
 # =========================================================
-# Header + connection check
+# Load
 # =========================================================
 st.title("Pabrai 213 Analyzer")
 st.caption(
-    "Pabrai-style 213개 체크리스트를 이용한 기업 분석 시스템"
+    "KOSPI 시가총액 상위 200 + S&P 500 · 자동 1차 스크리닝 + 213문항 수동 심층평가"
 )
 
 try:
     questions = get_questions()
     categories = get_categories()
-    question_count = len(questions)
-
+    universe = get_active_universe()
+    auto_scores = get_framework_scores()
+    frameworks = get_frameworks()
 except Exception as e:
-    st.error("Supabase 연결에 실패했습니다.")
+    st.error("Supabase 데이터를 불러오지 못했습니다.")
     st.code(str(e))
     st.stop()
 
+question_count = len(questions)
+counts = universe_counts(universe)
 
-# =========================================================
-# Automatic initial universe seed
-# =========================================================
-try:
-    with st.spinner(
-        "초기 종목군을 확인하고 있습니다..."
-    ):
-        seed_results = auto_seed_default_universes()
-
-    if seed_results:
-        inserted_total = sum(
-            row["inserted_count"]
-            for row in seed_results
-        )
-        if inserted_total:
-            st.success(
-                f"KOSPI / S&P 500 기본 종목군 "
-                f"{inserted_total}개를 새로 등록했습니다."
-            )
-
-except Exception as e:
-    st.warning(
-        "기본 종목군 자동 등록 중 일부 오류가 발생했습니다. "
-        "기업 관리 탭의 '종목군 최신화' 버튼으로 다시 시도할 수 있습니다."
-    )
-    st.caption(str(e))
-
-
-# =========================================================
-# Navigation
-# =========================================================
 (
     tab_dashboard,
-    tab_companies,
+    tab_universe,
     tab_new_analysis,
     tab_checklist,
     tab_result,
+    tab_auto_scores,
+    tab_frameworks,
 ) = st.tabs(
     [
         "📊 Dashboard",
         "🏢 기업 관리",
         "➕ 새 분석",
         "✅ Checklist",
-        "📈 결과",
+        "📈 수동 분석 결과",
+        "⭐ Auto Pabrai Score",
+        "🧠 투자철학 Framework",
     ]
 )
 
@@ -929,885 +678,551 @@ except Exception as e:
 # Dashboard
 # =========================================================
 with tab_dashboard:
-    try:
-        analyses = get_analyses()
+    analyses = get_analyses()
 
-        total_company_count = get_company_count()
-        kospi_count = get_company_count("KOSPI")
-        sp500_count = get_company_count("S&P500")
+    scored_ok = [
+        row for row in auto_scores
+        if row.get("total_score") is not None
+        and row.get("status") != "ERROR"
+    ]
 
-        completed_count = sum(
-            1
-            for item in analyses
-            if item.get("status") == "COMPLETED"
-        )
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("KOSPI 상위", counts["KOSPI_TOP200"])
+    c2.metric("S&P 500", counts["SP500"])
+    c3.metric("활성 Universe", len(universe))
+    c4.metric("Auto Score 완료", f"{len(scored_ok)}/{len(universe)}")
 
-        draft_count = sum(
-            1
-            for item in analyses
-            if item.get("status") == "DRAFT"
-        )
-
-        col1, col2, col3, col4 = st.columns(4)
-
-        col1.metric(
-            "등록 기업",
-            total_company_count,
-        )
-        col2.metric(
-            "KOSPI / S&P500",
-            f"{kospi_count} / {sp500_count}",
-        )
-        col3.metric(
-            "완료 분석",
-            completed_count,
-        )
-        col4.metric(
-            "진행 중",
-            draft_count,
-        )
-
-        st.caption(
-            f"체크리스트 {question_count}개 · "
-            "기본 종목군은 KOSPI와 S&P 500입니다."
-        )
-
-        st.divider()
-        st.subheader("최근 분석")
-
-        if not analyses:
-            st.info(
-                "아직 생성된 기업 분석이 없습니다."
-            )
-        else:
-            display_rows = []
-
-            for analysis in analyses[:30]:
-                company = analysis.get("companies") or {}
-
-                display_rows.append(
-                    {
-                        "기업": company.get("company_name", "-"),
-                        "Ticker": company.get("ticker", "-"),
-                        "Version": analysis.get("version"),
-                        "분석일": analysis.get("analysis_date"),
-                        "상태": analysis.get("status"),
-                        "점수": analysis.get("total_score"),
-                        "결정": analysis.get("decision"),
-                    }
-                )
-
-            st.dataframe(
-                display_rows,
-                use_container_width=True,
-                hide_index=True,
-            )
-
-    except Exception as e:
-        st.error(
-            "Dashboard 데이터를 불러오는 중 오류가 발생했습니다."
-        )
-        st.code(str(e))
-
-
-# =========================================================
-# Companies
-# =========================================================
-with tab_companies:
-    st.subheader("기본 종목군")
-
-    col1, col2, col3 = st.columns(3)
-
-    try:
-        col1.metric(
-            "KOSPI",
-            get_company_count("KOSPI"),
-        )
-        col2.metric(
-            "S&P 500",
-            get_company_count("S&P500"),
-        )
-        col3.metric(
-            "전체 등록 기업",
-            get_company_count(),
-        )
-    except Exception:
-        pass
-
-    st.caption(
-        "앱 최초 실행 시 KOSPI 전체와 S&P 500 전체 종목을 자동으로 등록합니다. "
-        "지수 구성 변경이나 신규 상장을 반영하려면 아래 버튼을 사용하세요."
+    c1, c2, c3 = st.columns(3)
+    c1.metric("213문항", question_count)
+    c2.metric(
+        "수동 분석 완료",
+        sum(1 for a in analyses if a.get("status") == "COMPLETED"),
+    )
+    c3.metric(
+        "수동 분석 중",
+        sum(1 for a in analyses if a.get("status") == "DRAFT"),
     )
 
-    if st.button(
-        "KOSPI + S&P 500 종목군 최신화",
-        use_container_width=True,
-    ):
-        try:
-            with st.spinner(
-                "최신 종목 목록을 확인하고 있습니다..."
-            ):
-                kospi_result = sync_universe("KOSPI")
-                sp500_result = sync_universe("S&P500")
-
-            st.success(
-                "최신화 완료 · "
-                f"KOSPI 신규 {kospi_result['inserted_count']}개 · "
-                f"S&P 500 신규 {sp500_result['inserted_count']}개"
-            )
-            st.rerun()
-
-        except Exception as e:
-            st.error(
-                "종목군 최신화 중 오류가 발생했습니다."
-            )
-            st.code(str(e))
-
-    st.divider()
-    st.subheader("종목코드 / Ticker로 기업 찾기")
-
-    st.caption(
-        "한국 기업: 6자리 숫자만 입력 (예: 005930) · "
-        "미국 기업: 영문자만 입력 (예: AAPL)"
+    st.info(
+        "Auto Pabrai Score는 703개 기업의 1차 스크리닝용입니다. "
+        "관심 기업은 '새 분석 → Checklist'에서 213개 문항으로 심층 평가할 수 있습니다."
     )
 
-    with st.form(
-        "company_symbol_form",
-        clear_on_submit=False,
-    ):
-        company_input = st.text_input(
-            "종목코드 / Ticker",
-            placeholder="005930 또는 AAPL",
-        )
+    if scored_ok:
+        top_rows = sorted(
+            scored_ok,
+            key=lambda x: float(x["total_score"]),
+            reverse=True,
+        )[:20]
 
-        find_company_clicked = st.form_submit_button(
-            "기업 확인",
-            type="primary",
-            use_container_width=True,
-        )
-
-    if find_company_clicked:
-        with st.spinner(
-            "기업 정보를 확인하고 있습니다..."
-        ):
-            company, created, error = resolve_company_from_input(
-                company_input,
-                create_if_missing=True,
-            )
-
-        if error:
-            st.error(error)
-
-        elif company:
-            if created:
-                st.success(
-                    f"{company['company_name']} "
-                    f"({company['ticker']})을 새로 등록했습니다."
-                )
-            else:
-                st.success(
-                    f"{company['company_name']} "
-                    f"({company['ticker']})이 등록되어 있습니다."
-                )
-
-            info_col1, info_col2, info_col3 = st.columns(3)
-            info_col1.metric(
-                "Ticker",
-                company.get("ticker", "-"),
-            )
-            info_col2.metric(
-                "기업명",
-                company.get("company_name", "-"),
-            )
-            info_col3.metric(
-                "시장",
-                company.get("market", "-"),
-            )
-
-    st.divider()
-    st.subheader("등록 기업 검색")
-
-    search_col1, search_col2 = st.columns([2, 1])
-
-    with search_col1:
-        company_search = st.text_input(
-            "검색",
-            placeholder="종목코드 또는 기업명",
-            key="company_search",
-        )
-
-    with search_col2:
-        company_market_filter = st.selectbox(
-            "시장",
-            ["전체", "KOSPI", "S&P500", "KOSDAQ", "NASDAQ", "NYSE", "AMEX"],
-            key="company_market_filter",
-        )
-
-    try:
-        company_rows = search_companies(
-            search_term=company_search,
-            market=company_market_filter,
-            limit=100,
-        )
-
-        st.caption(
-            "최대 100개까지 표시합니다."
-        )
-
+        st.subheader("Auto Pabrai Score 상위 20")
         st.dataframe(
             [
                 {
-                    "Ticker": row.get("ticker"),
-                    "기업명": row.get("company_name"),
-                    "Market": row.get("market"),
-                    "Country": row.get("country"),
+                    "Ticker": (r.get("companies") or {}).get("ticker"),
+                    "기업": (r.get("companies") or {}).get("company_name"),
+                    "Score": r.get("total_score"),
+                    "Coverage": f"{float(r.get('coverage_pct') or 0):.1f}%",
+                    "상태": r.get("status"),
+                    "기준일": r.get("as_of"),
                 }
-                for row in company_rows
+                for r in top_rows
             ],
             use_container_width=True,
             hide_index=True,
         )
 
-    except Exception as e:
-        st.error(
-            "기업 목록을 검색하는 중 오류가 발생했습니다."
-        )
-        st.code(str(e))
-
 
 # =========================================================
-# New analysis
+# Company management / 703 universe
 # =========================================================
-with tab_new_analysis:
-    st.subheader("새 기업 분석")
+with tab_universe:
+    st.subheader("활성 기업 Universe")
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("KOSPI 시총 상위", counts["KOSPI_TOP200"])
+    c2.metric("S&P 500", counts["SP500"])
+    c3.metric("합계", len(universe))
 
     st.caption(
-        "한국 기업은 6자리 종목코드, 미국 기업은 영문 Ticker를 입력하세요."
+        "KOSPI는 시가총액 기준 상위 200개 보통주 중심으로 유지합니다. "
+        "이전 KOSPI 종목은 DB를 삭제하지 않고 활성 리스트에서 제외해 과거 분석 이력을 보존합니다."
     )
 
-    analysis_company_input = st.text_input(
-        "분석할 종목코드 / Ticker",
-        placeholder="005930 또는 AAPL",
-        key="analysis_company_input",
-    )
-
-    if analysis_company_input:
-        company, _, error = resolve_company_from_input(
-            analysis_company_input,
-            create_if_missing=True,
+    col1, col2 = st.columns([2, 1])
+    with col1:
+        term = st.text_input(
+            "검색",
+            placeholder="005930, AAPL, 삼성전자, Apple",
+            key="universe_search",
         )
+    with col2:
+        universe_filter = st.selectbox(
+            "Universe",
+            ["전체", "KOSPI_TOP200", "SP500"],
+        )
+
+    rows = search_universe(
+        universe,
+        term=term,
+        universe=universe_filter,
+    )
+
+    st.dataframe(
+        [
+            {
+                "Rank": r.get("rank"),
+                "Universe": r.get("universe"),
+                "Ticker": (r.get("companies") or {}).get("ticker"),
+                "기업명": (r.get("companies") or {}).get("company_name"),
+                "Market": (r.get("companies") or {}).get("market"),
+                "Country": (r.get("companies") or {}).get("country"),
+                "기준일": r.get("as_of"),
+            }
+            for r in rows
+        ],
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    st.divider()
+    st.subheader("Universe 외 기업 직접 추가")
+    st.caption(
+        "한국: 6자리 숫자 · 미국: 영문자만 입력. "
+        "703개 기본 Universe에 없는 기업도 수동 심층분석용으로 추가할 수 있습니다."
+    )
+
+    with st.form("custom_company_form"):
+        raw_symbol = st.text_input(
+            "종목코드 / Ticker",
+            placeholder="005930 또는 AAPL",
+        )
+        add_clicked = st.form_submit_button(
+            "기업 확인/추가",
+            type="primary",
+            use_container_width=True,
+        )
+
+    if add_clicked:
+        company, created, error = resolve_company(raw_symbol)
+        if error:
+            st.error(error)
+        else:
+            verb = "추가했습니다" if created else "이미 등록되어 있습니다"
+            st.success(
+                f"{company['company_name']} ({company['ticker']})을 {verb}."
+            )
+
+
+# =========================================================
+# New manual analysis
+# =========================================================
+with tab_new_analysis:
+    st.subheader("새 213문항 심층 분석")
+    st.caption("한국 6자리 종목코드 또는 미국 영문 Ticker를 입력하세요.")
+
+    raw = st.text_input(
+        "분석할 종목",
+        placeholder="005930 또는 AAPL",
+        key="new_analysis_symbol",
+    )
+
+    if raw:
+        company, _, error = resolve_company(raw)
 
         if error:
             st.error(error)
-
-        elif company:
+        else:
             company_id = company["id"]
-            next_version = get_next_version(
-                company_id
-            )
+            next_version = get_next_version(company_id)
 
-            col1, col2, col3 = st.columns(3)
+            c1, c2, c3 = st.columns(3)
+            c1.metric("기업", company.get("company_name"))
+            c2.metric("Ticker", company.get("ticker"))
+            c3.metric("시장", company.get("market"))
 
-            col1.metric(
-                "기업",
-                company.get("company_name", "-"),
-            )
-            col2.metric(
-                "Ticker",
-                company.get("ticker", "-"),
-            )
-            col3.metric(
-                "시장",
-                company.get("market", "-"),
-            )
-
-            st.info(
-                f"새 분석은 Version "
-                f"{next_version}으로 생성됩니다."
-            )
+            st.info(f"새 분석은 Version {next_version}으로 생성됩니다.")
 
             if st.button(
                 "새 분석 시작",
                 type="primary",
                 use_container_width=True,
             ):
-                try:
-                    new_analysis = create_analysis(
-                        company_id
-                    )
-
-                    st.session_state[
-                        "current_analysis_id"
-                    ] = new_analysis["id"]
-
-                    st.success(
-                        "새 분석이 생성되었습니다. "
-                        "Checklist 탭에서 평가를 시작하세요."
-                    )
-
-                    st.write(
-                        f"Version: "
-                        f"**{new_analysis['version']}**"
-                    )
-                    st.write(
-                        "Status: **DRAFT**"
-                    )
-
-                except Exception as e:
-                    st.error(
-                        "새 분석 생성 중 오류가 발생했습니다."
-                    )
-                    st.code(str(e))
+                new_analysis = create_analysis(company_id)
+                st.session_state["current_analysis_id"] = new_analysis["id"]
+                st.success(
+                    f"Version {new_analysis['version']} 생성 완료. Checklist 탭에서 평가하세요."
+                )
 
 
 # =========================================================
-# Checklist
+# Manual 213 checklist
 # =========================================================
 with tab_checklist:
     st.subheader("213 Checklist")
 
-    try:
-        analyses = get_analyses()
+    analyses = get_analyses()
 
-        if not analyses:
-            st.info(
-                "먼저 '새 분석' 탭에서 "
-                "분석을 생성해주세요."
-            )
-
-        else:
-            selected_analysis = analysis_selector(
-                analyses,
-                key="checklist_analysis_selector",
-            )
-
-            if selected_analysis:
-                st.session_state[
-                    "current_analysis_id"
-                ] = selected_analysis["id"]
-
-                analysis_id = selected_analysis["id"]
-                company = (
-                    selected_analysis.get("companies")
-                    or {}
-                )
-
-                answers = get_answers(analysis_id)
-                answer_map = build_answer_map(answers)
-                summary = calculate_summary(
-                    questions,
-                    answers,
-                )
-
-                col1, col2, col3, col4 = st.columns(4)
-
-                col1.metric(
-                    "기업",
-                    company.get("ticker", "-"),
-                )
-                col2.metric(
-                    "Version",
-                    selected_analysis.get("version", "-"),
-                )
-                col3.metric(
-                    "평가 완료",
-                    f"{summary['completed_count']}/{question_count}",
-                )
-                col4.metric(
-                    "현재 점수",
-                    (
-                        f"{summary['overall_score']:.1f}"
-                        if summary["overall_score"] is not None
-                        else "-"
-                    ),
-                )
-
-                st.progress(
-                    min(
-                        1.0,
-                        summary["completion_pct"] / 100.0,
-                    ),
-                    text=(
-                        f"진행률 "
-                        f"{summary['completion_pct']:.1f}%"
-                    ),
-                )
-
-                if summary["core_zero_items"]:
-                    st.error(
-                        "핵심 영역에서 0점 항목이 "
-                        f"{len(summary['core_zero_items'])}개 있습니다."
-                    )
-
-                category_names = [
-                    item["category"]
-                    for item in categories
-                ]
-
-                selected_category = st.selectbox(
-                    "Category",
-                    category_names,
-                    key="checklist_category",
-                )
-
-                category_questions = [
-                    q
-                    for q in questions
-                    if q["category"] == selected_category
-                ]
-
-                category_summary = summary[
-                    "category_data"
-                ].get(
-                    selected_category,
-                    {},
-                )
-
-                category_score = category_summary.get(
-                    "score"
-                )
-
-                cat_col1, cat_col2, cat_col3 = st.columns(3)
-
-                cat_col1.metric(
-                    "카테고리 문항",
-                    len(category_questions),
-                )
-                cat_col2.metric(
-                    "카테고리 점수",
-                    (
-                        f"{category_score:.1f}"
-                        if category_score is not None
-                        else "-"
-                    ),
-                )
-                cat_col3.metric(
-                    "완료",
-                    (
-                        f"{category_summary.get('completed_count', 0)}"
-                        f"/{len(category_questions)}"
-                    ),
-                )
-
-                st.caption(
-                    "점수 기준: "
-                    "5 매우 우수 · 4 양호 · "
-                    "3 중립/추가 확인 · "
-                    "2 주의 · 1 중대한 우려 · "
-                    "0 치명적 문제 · N/A 비적용"
-                )
-
-                st.divider()
-
-                for question in category_questions:
-                    qno = int(
-                        question["question_no"]
-                    )
-                    current = answer_map.get(qno)
-
-                    current_choice = (
-                        answer_to_score_choice(
-                            current
-                        )
-                    )
-
-                    status_text = (
-                        current.get("status")
-                        if current
-                        else "UNKNOWN"
-                    )
-
-                    expander_title = (
-                        f"Q{qno} · "
-                        f"[{question['source_grade']}] · "
-                        f"{float(question['weight_pct']):.3f}% · "
-                        f"{status_text}"
-                    )
-
-                    with st.expander(
-                        expander_title,
-                        expanded=False,
-                    ):
-                        st.markdown(
-                            f"**{question['question']}**"
-                        )
-
-                        with st.form(
-                            f"answer_form_{analysis_id}_{qno}"
-                        ):
-                            score_choice = st.radio(
-                                "평가",
-                                SCORE_OPTIONS,
-                                index=SCORE_OPTIONS.index(
-                                    current_choice
-                                ),
-                                horizontal=True,
-                                key=(
-                                    f"score_"
-                                    f"{analysis_id}_"
-                                    f"{qno}"
-                                ),
-                            )
-
-                            note = st.text_area(
-                                "메모",
-                                value=(
-                                    current.get("note")
-                                    if current
-                                    and current.get("note")
-                                    else ""
-                                ),
-                                placeholder=(
-                                    "판단 근거, 위험요인, "
-                                    "추가 확인사항 등을 기록"
-                                ),
-                                key=(
-                                    f"note_"
-                                    f"{analysis_id}_"
-                                    f"{qno}"
-                                ),
-                            )
-
-                            evidence = st.text_input(
-                                "근거 자료",
-                                value=(
-                                    current.get("evidence")
-                                    if current
-                                    and current.get("evidence")
-                                    else ""
-                                ),
-                                placeholder=(
-                                    "예: 2026 10-K p.72, "
-                                    "IR 자료 등"
-                                ),
-                                key=(
-                                    f"evidence_"
-                                    f"{analysis_id}_"
-                                    f"{qno}"
-                                ),
-                            )
-
-                            evidence_url = st.text_input(
-                                "근거 URL",
-                                value=(
-                                    current.get("evidence_url")
-                                    if current
-                                    and current.get("evidence_url")
-                                    else ""
-                                ),
-                                placeholder="https://...",
-                                key=(
-                                    f"url_"
-                                    f"{analysis_id}_"
-                                    f"{qno}"
-                                ),
-                            )
-
-                            save_clicked = st.form_submit_button(
-                                "이 문항 저장",
-                                type="primary",
-                                use_container_width=True,
-                            )
-
-                        if save_clicked:
-                            try:
-                                score, status = score_to_status(
-                                    score_choice
-                                )
-
-                                save_answer(
-                                    analysis_id,
-                                    qno,
-                                    score,
-                                    status,
-                                    note,
-                                    evidence,
-                                    evidence_url,
-                                )
-
-                                refreshed_answers = get_answers(
-                                    analysis_id
-                                )
-
-                                refreshed_summary = calculate_summary(
-                                    questions,
-                                    refreshed_answers,
-                                )
-
-                                if (
-                                    refreshed_summary["overall_score"]
-                                    is not None
-                                ):
-                                    update_analysis(
-                                        analysis_id,
-                                        total_score=(
-                                            refreshed_summary["overall_score"]
-                                        ),
-                                    )
-
-                                st.success(
-                                    f"Q{qno} 저장 완료"
-                                )
-                                st.rerun()
-
-                            except Exception as e:
-                                st.error(
-                                    "저장 중 오류가 발생했습니다."
-                                )
-                                st.code(str(e))
-
-    except Exception as e:
-        st.error(
-            "Checklist를 불러오는 중 오류가 발생했습니다."
+    if not analyses:
+        st.info("먼저 '새 분석' 탭에서 분석을 생성해주세요.")
+    else:
+        selected_analysis = analysis_selector(
+            analyses,
+            key="checklist_analysis_selector",
         )
-        st.code(str(e))
+        analysis_id = selected_analysis["id"]
+        st.session_state["current_analysis_id"] = analysis_id
+
+        company = selected_analysis.get("companies") or {}
+        answers = get_answers(analysis_id)
+        answer_map = build_answer_map(answers)
+        summary = calculate_summary(questions, answers)
+
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("기업", company.get("ticker", "-"))
+        c2.metric("Version", selected_analysis.get("version", "-"))
+        c3.metric("완료", f"{summary['completed_count']}/{question_count}")
+        c4.metric(
+            "현재 점수",
+            f"{summary['overall_score']:.1f}"
+            if summary["overall_score"] is not None else "-",
+        )
+
+        st.progress(
+            min(1.0, summary["completion_pct"] / 100),
+            text=f"진행률 {summary['completion_pct']:.1f}%",
+        )
+
+        if summary["core_zero_items"]:
+            st.error(
+                f"Leverage / Moat / Management 핵심 영역에 "
+                f"0점 문항 {len(summary['core_zero_items'])}개가 있습니다."
+            )
+
+        category_names = [c["category"] for c in categories]
+        selected_category = st.selectbox(
+            "Category",
+            category_names,
+            key="manual_category",
+        )
+
+        category_questions = [
+            q for q in questions
+            if q["category"] == selected_category
+        ]
+
+        category_summary = summary["category_data"].get(
+            selected_category,
+            {},
+        )
+
+        c1, c2, c3 = st.columns(3)
+        c1.metric("문항 수", len(category_questions))
+        c2.metric(
+            "카테고리 점수",
+            f"{category_summary.get('score'):.1f}"
+            if category_summary.get("score") is not None else "-",
+        )
+        c3.metric(
+            "완료",
+            f"{category_summary.get('completed_count', 0)}/{len(category_questions)}",
+        )
+
+        st.caption(
+            "5 매우 우수 · 4 양호 · 3 중립/추가 확인 · "
+            "2 주의 · 1 중대한 우려 · 0 치명적 문제 · N/A 비적용"
+        )
+
+        for question in category_questions:
+            qno = int(question["question_no"])
+            current = answer_map.get(qno)
+            current_choice = answer_to_score_choice(current)
+            status_text = current.get("status") if current else "UNKNOWN"
+
+            with st.expander(
+                f"Q{qno} · [{question['source_grade']}] · "
+                f"{float(question['weight_pct']):.3f}% · {status_text}"
+            ):
+                st.markdown(f"**{question['question']}**")
+
+                with st.form(f"manual_q_{analysis_id}_{qno}"):
+                    score_choice = st.radio(
+                        "평가",
+                        SCORE_OPTIONS,
+                        index=SCORE_OPTIONS.index(current_choice),
+                        horizontal=True,
+                    )
+                    note = st.text_area(
+                        "메모",
+                        value=current.get("note") if current and current.get("note") else "",
+                    )
+                    evidence = st.text_input(
+                        "근거 자료",
+                        value=current.get("evidence") if current and current.get("evidence") else "",
+                    )
+                    evidence_url = st.text_input(
+                        "근거 URL",
+                        value=current.get("evidence_url") if current and current.get("evidence_url") else "",
+                    )
+                    save_clicked = st.form_submit_button(
+                        "이 문항 저장",
+                        type="primary",
+                        use_container_width=True,
+                    )
+
+                if save_clicked:
+                    score, status = score_to_status(score_choice)
+                    save_answer(
+                        analysis_id,
+                        qno,
+                        score,
+                        status,
+                        note,
+                        evidence,
+                        evidence_url,
+                    )
+
+                    refreshed = calculate_summary(
+                        questions,
+                        get_answers(analysis_id),
+                    )
+                    if refreshed["overall_score"] is not None:
+                        update_analysis(
+                            analysis_id,
+                            total_score=refreshed["overall_score"],
+                        )
+                    st.rerun()
 
 
 # =========================================================
-# Result
+# Manual result
 # =========================================================
 with tab_result:
-    st.subheader("분석 결과")
+    st.subheader("213문항 수동 분석 결과")
+    analyses = get_analyses()
 
-    try:
-        analyses = get_analyses()
+    if not analyses:
+        st.info("아직 생성된 분석이 없습니다.")
+    else:
+        selected_analysis = analysis_selector(
+            analyses,
+            key="manual_result_selector",
+        )
+        analysis_id = selected_analysis["id"]
+        company = selected_analysis.get("companies") or {}
 
-        if not analyses:
-            st.info(
-                "아직 생성된 분석이 없습니다."
+        summary = calculate_summary(
+            questions,
+            get_answers(analysis_id),
+        )
+
+        score = summary["overall_score"]
+        suggested = suggested_decision(summary)
+
+        st.markdown(
+            f"### {company.get('company_name', '-')} ({company.get('ticker', '-')})"
+        )
+        st.caption(
+            f"Version {selected_analysis.get('version')} · "
+            f"분석일 {selected_analysis.get('analysis_date')}"
+        )
+
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("종합점수", f"{score:.1f}" if score is not None else "-")
+        c2.metric("진행률", f"{summary['completion_pct']:.1f}%")
+        c3.metric("FAIL", summary["fail_count"])
+        c4.metric("UNKNOWN", summary["unknown_count"])
+
+        if summary["core_zero_items"]:
+            st.error("핵심 3영역에 0점 문항이 존재합니다.")
+
+        st.info(f"자동 참고판정: **{suggested}**")
+
+        st.subheader("카테고리별 점수")
+        st.dataframe(
+            [
+                {
+                    "Category": c["category"],
+                    "가중치": f"{float(c['category_weight_pct']):.1f}%",
+                    "점수": (
+                        round(
+                            summary["category_data"].get(c["category"], {}).get("score"),
+                            1,
+                        )
+                        if summary["category_data"].get(c["category"], {}).get("score") is not None
+                        else None
+                    ),
+                    "완료": (
+                        f"{summary['category_data'].get(c['category'], {}).get('completed_count', 0)}"
+                        f"/{summary['category_data'].get(c['category'], {}).get('total_count', 0)}"
+                    ),
+                }
+                for c in categories
+            ],
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        decision_options = [
+            "GO",
+            "WAIT",
+            "NO-GO",
+            "REVIEW REQUIRED",
+        ]
+        current_decision = selected_analysis.get("decision") or suggested
+        if current_decision not in decision_options:
+            current_decision = "REVIEW REQUIRED"
+
+        with st.form(f"complete_{analysis_id}"):
+            final_decision = st.selectbox(
+                "최종 Decision",
+                decision_options,
+                index=decision_options.index(current_decision),
+            )
+            final_notes = st.text_area(
+                "최종 메모",
+                value=selected_analysis.get("notes") or "",
+            )
+            complete_clicked = st.form_submit_button(
+                "분석 완료로 저장",
+                type="primary",
+                use_container_width=True,
             )
 
+        if complete_clicked:
+            update_analysis(
+                analysis_id,
+                total_score=score if score is not None else 0,
+                status="COMPLETED",
+                decision=final_decision,
+                notes=final_notes,
+            )
+            st.rerun()
+
+
+# =========================================================
+# Auto Pabrai Score
+# =========================================================
+with tab_auto_scores:
+    st.subheader("Pabrai Score (자동 1차)")
+
+    st.warning(
+        "이 점수는 213개 질문을 근거 없이 자동으로 전부 채운 값이 아닙니다. "
+        "재무/시장 데이터로 측정 가능한 영역만 프록시로 평가하며 Coverage를 함께 확인해야 합니다."
+    )
+
+    ranked = [
+        r for r in auto_scores
+        if r.get("total_score") is not None
+    ]
+    ranked.sort(
+        key=lambda x: float(x.get("total_score") or -1),
+        reverse=True,
+    )
+
+    score_search = st.text_input(
+        "Ticker 상세 조회",
+        placeholder="AAPL 또는 005930",
+        key="auto_score_search",
+    ).strip().upper()
+
+    if score_search:
+        selected = None
+        for row in auto_scores:
+            company = row.get("companies") or {}
+            if str(company.get("ticker", "")).upper() == score_search:
+                selected = row
+                break
+
+        if not selected:
+            st.info("아직 해당 기업의 자동 점수가 없습니다.")
         else:
-            selected_analysis = analysis_selector(
-                analyses,
-                key="result_analysis_selector",
-            )
+            company = selected.get("companies") or {}
+            c1, c2, c3 = st.columns(3)
+            c1.metric("기업", f"{company.get('company_name')} ({company.get('ticker')})")
+            c2.metric("Auto Pabrai Score", selected.get("total_score"))
+            c3.metric("Coverage", f"{float(selected.get('coverage_pct') or 0):.1f}%")
 
-            analysis_id = selected_analysis["id"]
-            company = (
-                selected_analysis.get("companies")
-                or {}
-            )
+            details = selected.get("details") or {}
+            category_scores = details.get("category_scores") or {}
+            factors = details.get("factors") or []
 
-            answers = get_answers(
-                analysis_id
-            )
-
-            summary = calculate_summary(
-                questions,
-                answers,
-            )
-
-            overall_score = summary[
-                "overall_score"
-            ]
-
-            suggested = suggested_decision(
-                summary
-            )
-
-            st.markdown(
-                f"### {company.get('company_name', '-')} "
-                f"({company.get('ticker', '-')})"
-            )
-
-            st.caption(
-                f"Version {selected_analysis.get('version')} · "
-                f"분석일 {selected_analysis.get('analysis_date')}"
-            )
-
-            col1, col2, col3, col4 = st.columns(4)
-
-            col1.metric(
-                "종합점수",
-                (
-                    f"{overall_score:.1f}"
-                    if overall_score is not None
-                    else "-"
-                ),
-            )
-            col2.metric(
-                "평가 진행률",
-                f"{summary['completion_pct']:.1f}%",
-            )
-            col3.metric(
-                "FAIL",
-                summary["fail_count"],
-            )
-            col4.metric(
-                "UNKNOWN",
-                summary["unknown_count"],
-            )
-
-            st.progress(
-                min(
-                    1.0,
-                    summary["completion_pct"] / 100.0,
-                ),
-                text=(
-                    f"{summary['completed_count']}"
-                    f"/{question_count} 문항 완료"
-                ),
-            )
-
-            if summary["core_zero_items"]:
-                st.error(
-                    "Leverage / Moat / "
-                    "Management & Ownership에서 "
-                    "0점 문항이 존재합니다. "
-                    "종합점수와 별도로 반드시 검토하세요."
+            if category_scores:
+                st.subheader("카테고리별 Auto Score")
+                st.dataframe(
+                    [{"Category": k, "Score": v} for k, v in category_scores.items()],
+                    use_container_width=True,
+                    hide_index=True,
                 )
 
-                for item in summary[
-                    "core_zero_items"
-                ]:
-                    st.write(
-                        f"- Q{item['question_no']} "
-                        f"[{item['category']}] "
-                        f"{item['question']}"
-                    )
-
-            st.info(
-                f"자동 참고판정: **{suggested}**  \n"
-                "이 판정은 공식 Pabrai 기준이 아니라 "
-                "현재 앱의 보조 규칙입니다."
-            )
-
-            st.divider()
-            st.subheader("카테고리별 점수")
-
-            category_rows = []
-
-            for category in categories:
-                category_name = category["category"]
-                data = summary[
-                    "category_data"
-                ].get(
-                    category_name,
-                    {},
+            if factors:
+                st.subheader("자동 Factor")
+                st.dataframe(
+                    factors,
+                    use_container_width=True,
+                    hide_index=True,
                 )
 
-                category_rows.append(
-                    {
-                        "Category": category_name,
-                        "배정 가중치": (
-                            f"{float(category['category_weight_pct']):.1f}%"
-                        ),
-                        "점수": (
-                            round(
-                                data["score"],
-                                1,
-                            )
-                            if data.get("score") is not None
-                            else None
-                        ),
-                        "완료": (
-                            f"{data.get('completed_count', 0)}"
-                            f"/{data.get('total_count', 0)}"
-                        ),
-                    }
-                )
+    st.divider()
+    st.subheader("전체 순위")
+    st.dataframe(
+        [
+            {
+                "Rank": i,
+                "Ticker": (r.get("companies") or {}).get("ticker"),
+                "기업명": (r.get("companies") or {}).get("company_name"),
+                "Score": r.get("total_score"),
+                "Coverage": f"{float(r.get('coverage_pct') or 0):.1f}%",
+                "Status": r.get("status"),
+                "기준일": r.get("as_of"),
+            }
+            for i, r in enumerate(ranked, start=1)
+        ],
+        use_container_width=True,
+        hide_index=True,
+    )
 
+
+# =========================================================
+# Framework foundation
+# =========================================================
+with tab_frameworks:
+    st.subheader("다중 투자철학 Framework")
+
+    st.write(
+        "Pabrai 외에도 Buffett-style, Munger-style 분석을 동일한 DB 구조에서 "
+        "확장할 수 있도록 Framework/Dimension을 분리했습니다."
+    )
+
+    for framework in frameworks:
+        with st.expander(
+            f"{framework['name']} · {framework['framework_type']}",
+            expanded=framework["id"] == "PABRAI_AUTO",
+        ):
+            st.write(framework.get("description") or "")
+
+            dims = get_framework_dimensions(framework["id"])
             st.dataframe(
-                category_rows,
+                [
+                    {
+                        "Dimension": d["dimension_name"],
+                        "Weight": f"{float(d['weight_pct']):.1f}%",
+                        "설명": d.get("description"),
+                    }
+                    for d in dims
+                ],
                 use_container_width=True,
                 hide_index=True,
             )
 
-            st.divider()
-            st.subheader("분석 완료 / 최종 판단")
-
-            current_decision = (
-                selected_analysis.get("decision")
-                or suggested
-            )
-
-            decision_options = [
-                "GO",
-                "WAIT",
-                "NO-GO",
-                "REVIEW REQUIRED",
-            ]
-
-            if current_decision not in decision_options:
-                current_decision = "REVIEW REQUIRED"
-
-            with st.form(
-                f"complete_analysis_{analysis_id}"
-            ):
-                final_decision = st.selectbox(
-                    "최종 Decision",
-                    decision_options,
-                    index=decision_options.index(
-                        current_decision
-                    ),
+            if framework["id"] != "PABRAI_AUTO":
+                st.info(
+                    "기반 구조가 준비되어 있습니다. 다음 단계에서 각 Dimension에 "
+                    "정량 Factor, 정성 체크리스트, 근거자료 및 AI 보조평가를 연결할 수 있습니다."
                 )
 
-                final_notes = st.text_area(
-                    "분석 요약 / 최종 메모",
-                    value=(
-                        selected_analysis.get("notes")
-                        or ""
-                    ),
-                    placeholder=(
-                        "핵심 투자 논리, 반대 논리, "
-                        "확인해야 할 조건 등을 기록"
-                    ),
-                )
-
-                complete_clicked = st.form_submit_button(
-                    "분석 완료로 저장",
-                    type="primary",
-                    use_container_width=True,
-                )
-
-            if complete_clicked:
-                if summary["unknown_count"] > 0:
-                    st.warning(
-                        f"아직 UNKNOWN 문항이 "
-                        f"{summary['unknown_count']}개 있습니다. "
-                        "그래도 완료 저장은 가능하지만 "
-                        "추가 확인을 권장합니다."
-                    )
-
-                try:
-                    update_analysis(
-                        analysis_id,
-                        total_score=(
-                            overall_score
-                            if overall_score is not None
-                            else 0
-                        ),
-                        status="COMPLETED",
-                        decision=final_decision,
-                        notes=final_notes,
-                    )
-
-                    st.success(
-                        "분석 결과를 완료 상태로 저장했습니다."
-                    )
-                    st.rerun()
-
-                except Exception as e:
-                    st.error(
-                        "분석 완료 저장 중 오류가 발생했습니다."
-                    )
-                    st.code(str(e))
-
-    except Exception as e:
-        st.error(
-            "분석 결과를 불러오는 중 오류가 발생했습니다."
-        )
-        st.code(str(e))
-
-
-# =========================================================
-# Footer
-# =========================================================
 st.divider()
-
 st.caption(
-    "Pabrai-style 213 Checklist · "
-    "Leverage → Moat → Management & Ownership · "
-    "투자 의사결정을 보조하기 위한 분석 도구"
+    "Pabrai-style 213 Checklist · Auto Score + Manual Deep Dive · "
+    "투자 의사결정 보조용 분석 도구"
 )
