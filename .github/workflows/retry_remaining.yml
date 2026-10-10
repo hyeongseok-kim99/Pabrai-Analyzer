@@ -1,30 +1,23 @@
-name: Auto score investment universe
+name: Retry remaining Pabrai scores
 
 on:
   workflow_dispatch:
-    inputs:
-      batch_size:
-        description: "Companies to score in this run"
-        required: false
-        default: "30"
-  schedule:
-    - cron: "17 * * * *"
 
 jobs:
-  auto-score:
+  retry-remaining:
     runs-on: ubuntu-latest
-    timeout-minutes: 55
+    timeout-minutes: 90
 
     env:
       SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
       SUPABASE_SECRET_KEY: ${{ secrets.SUPABASE_SECRET_KEY }}
-      BATCH_SIZE: ${{ github.event.inputs.batch_size || '30' }}
+      BATCH_SIZE: "9999"
       REFRESH_DAYS: "30"
       FORCE_REFRESH: "0"
-      RETRY_ONLY: "0"
+      RETRY_ONLY: "1"
       SHARD_COUNT: "1"
       SHARD_INDEX: "0"
-      REQUEST_DELAY: "1.2"
+      REQUEST_DELAY: "2.0"
 
     steps:
       - name: Checkout
@@ -45,5 +38,5 @@ jobs:
           test -f scripts/auto_score.py
           python -m py_compile scoring_engine.py scripts/auto_score.py
 
-      - name: Score next batch
+      - name: Retry only missing or error companies
         run: python scripts/auto_score.py
