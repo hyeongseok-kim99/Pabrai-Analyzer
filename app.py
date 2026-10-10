@@ -1,6 +1,8 @@
 import streamlit as st
 from supabase import create_client
 
+from scoring_engine import build_question_breakdown
+
 st.set_page_config(
     page_title="Investment Ranking",
     page_icon="📊",
@@ -82,6 +84,22 @@ def get_questions():
     return result.data or []
 
 
+def _safe_float(value):
+    try:
+        if value is None:
+            return None
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _fmt_multiple(value):
+    value = _safe_float(value)
+    if value is None:
+        return None
+    return round(value, 2)
+
+
 def build_rank_rows(universe_rows, score_rows):
     score_map = {row["company_id"]: row for row in score_rows}
     rows = []
@@ -89,6 +107,21 @@ def build_rank_rows(universe_rows, score_rows):
     for item in universe_rows:
         company = item.get("companies") or {}
         score = score_map.get(item["company_id"])
+        details = (score or {}).get("details") or {}
+        raw_metrics = details.get("raw_metrics") or {}
+        coverage = float((score or {}).get("coverage_pct") or 0)
+        status = (score or {}).get("status") or "PENDING"
+        total_score = (score or {}).get("total_score")
+
+        # Rank is only considered reliable when the model has >=70% weighted
+        # quantitative coverage (AUTO_PRELIM). Lower-coverage scores remain
+        # visible but are intentionally left unranked.
+        rank_eligible = (
+            total_score is not None
+            and status == "AUTO_PRELIM"
+            and coverage >= 70
+        )
+
         rows.append({
             "company_id": item["company_id"],
             "universe": item.get("universe"),
@@ -97,17 +130,32 @@ def build_rank_rows(universe_rows, score_rows):
             "company_name": company.get("company_name"),
             "market": company.get("market"),
             "country": company.get("country"),
-            "score": score.get("total_score") if score else None,
-            "coverage": float(score.get("coverage_pct") or 0) if score else 0.0,
-            "status": score.get("status") if score else "PENDING",
-            "score_date": score.get("as_of") if score else None,
+            "score": total_score,
+            "coverage": coverage,
+            "status": status,
+            "score_date": (score or {}).get("as_of"),
+            "per": _safe_float(raw_metrics.get("trailingPE")),
+            "pbr": _safe_float(raw_metrics.get("priceToBook")),
+            "rank_eligible": rank_eligible,
         })
 
-    scored = [row for row in rows if row["score"] is not None]
-    scored.sort(
+    ranked_valid = [row for row in rows if row["rank_eligible"]]
+    ranked_valid.sort(
         key=lambda row: (
             -float(row["score"]),
             -float(row["coverage"]),
+            str(row["ticker"] or ""),
+        )
+    )
+
+    scored_low_coverage = [
+        row for row in rows
+        if row["score"] is not None and not row["rank_eligible"]
+    ]
+    scored_low_coverage.sort(
+        key=lambda row: (
+            -float(row["coverage"]),
+            -float(row["score"]),
             str(row["ticker"] or ""),
         )
     )
@@ -120,17 +168,13 @@ def build_rank_rows(universe_rows, score_rows):
         )
     )
 
-    ranked = scored + pending
-    rank_no = 0
-    for row in ranked:
-        if row["score"] is not None:
-            rank_no += 1
-            row["rank"] = rank_no
-        else:
-            row["rank"] = None
+    for rank_no, row in enumerate(ranked_valid, start=1):
+        row["rank"] = rank_no
 
-    return ranked
+    for row in scored_low_coverage + pending:
+        row["rank"] = None
 
+    return ranked_valid + scored_low_coverage + pending
 
 def render_pabrai_ranking(universe_rows, score_rows):
     st.subheader("Pabrai Ranking")
@@ -142,14 +186,20 @@ def render_pabrai_ranking(universe_rows, score_rows):
     ranked = build_rank_rows(universe_rows, score_rows)
     total = len(ranked)
     scored_count = sum(1 for row in ranked if row["score"] is not None)
+    ranked_count = sum(1 for row in ranked if row["rank_eligible"])
     pending_count = total - scored_count
-    score_values = [float(row["score"]) for row in ranked if row["score"] is not None]
+    score_values = [
+        float(row["score"])
+        for row in ranked
+        if row["rank_eligible"]
+    ]
 
-    c1, c2, c3, c4 = st.columns(4)
+    c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("전체 기업", total)
     c2.metric("점수 완료", f"{scored_count}/{total}")
-    c3.metric("대기", pending_count)
-    c4.metric(
+    c3.metric("신뢰 랭킹", ranked_count)
+    c4.metric("대기", pending_count)
+    c5.metric(
         "평균 Score",
         f"{sum(score_values) / len(score_values):.1f}" if score_values else "-",
     )
@@ -158,6 +208,18 @@ def render_pabrai_ranking(universe_rows, score_rows):
         st.progress(
             scored_count / total,
             text=f"자동 평가 진행률 {scored_count}/{total} ({scored_count / total * 100:.1f}%)",
+        )
+
+    with st.expander("상태와 Coverage 기준 보기"):
+        st.markdown(
+            """
+- **AUTO_PRELIM**: 정량 Factor 가중치의 **70% 이상**을 실제 데이터로 평가했습니다. 이 상태만 공식 Rank에 포함합니다.
+- **LOW_COVERAGE**: Coverage가 **45% 이상 70% 미만**입니다. 참고 점수는 표시하지만 Rank에는 넣지 않습니다.
+- **INSUFFICIENT_DATA**: Coverage가 **45% 미만**입니다. 일부 데이터만으로 계산된 점수라 신뢰도가 낮아 Rank에서 제외합니다.
+- **PENDING / ERROR**: 아직 계산되지 않았거나 외부 데이터 조회에 실패한 기업입니다.
+
+**Coverage**는 213문항 중 답한 비율이 아니라, 자동 Pabrai Score에 연결된 정량 Factor의 전체 가중치 100% 중 실제 데이터가 확보되어 계산에 사용된 가중치 비율입니다.
+            """
         )
 
     st.divider()
@@ -198,11 +260,13 @@ def render_pabrai_ranking(universe_rows, score_rows):
     st.dataframe(
         [
             {
-                "Rank": row["rank"] if row["score"] is not None else "-",
+                "Rank": row["rank"] if row["rank_eligible"] else "-",
                 "Ticker": row["ticker"],
                 "기업명": row["company_name"],
                 "Universe": "KOSPI 200" if row["universe"] == "KOSPI_TOP200" else "S&P 500",
                 "Pabrai Score": round(float(row["score"]), 1) if row["score"] is not None else None,
+                "PER": _fmt_multiple(row["per"]),
+                "PBR": _fmt_multiple(row["pbr"]),
                 "Coverage": f"{row['coverage']:.1f}%" if row["score"] is not None else "-",
                 "상태": row["status"],
                 "기준일": row["score_date"],
@@ -215,10 +279,9 @@ def render_pabrai_ranking(universe_rows, score_rows):
     )
 
     st.caption(
-        "Rank는 현재 계산이 완료된 기업끼리의 순위입니다. "
-        "PENDING은 자동 평가가 아직 끝나지 않은 기업입니다."
+        "Rank는 AUTO_PRELIM(정량 Coverage 70% 이상) 기업만 대상으로 계산합니다. "
+        "LOW_COVERAGE / INSUFFICIENT_DATA 기업도 점수·PER·PBR은 확인할 수 있지만 순위에서는 제외됩니다."
     )
-
 
 def render_pabrai2(score_rows, questions):
     st.subheader("Pabrai2 · 213문항 상세")
@@ -250,13 +313,33 @@ def render_pabrai2(score_rows, questions):
     company = selected.get("companies") or {}
     details = selected.get("details") or {}
     breakdown = details.get("question_breakdown") or []
-    breakdown_map = {int(row["question_no"]): row for row in breakdown}
 
-    c1, c2, c3, c4 = st.columns(4)
+    # Older score rows may predate the Pabrai2 stored breakdown.
+    # If factor data is already present, build the 213-question detail in memory
+    # so a full re-score is not required just to view Pabrai2.
+    if not breakdown and details.get("factors"):
+        qdetail = build_question_breakdown(questions, details)
+        breakdown = qdetail["rows"]
+        details = {
+            **details,
+            "question_coverage_pct": qdetail["question_coverage_pct"],
+            "auto_scored_question_count": qdetail["auto_scored_count"],
+            "qualitative_question_count": qdetail["qualitative_count"],
+            "data_missing_question_count": qdetail["data_missing_count"],
+        }
+
+    breakdown_map = {int(row["question_no"]): row for row in breakdown}
+    raw_metrics = details.get("raw_metrics") or {}
+    per_value = _safe_float(raw_metrics.get("trailingPE"))
+    pbr_value = _safe_float(raw_metrics.get("priceToBook"))
+
+    c1, c2, c3, c4, c5, c6 = st.columns(6)
     c1.metric("기업", f"{company.get('company_name')} ({company.get('ticker')})")
     c2.metric("Pabrai Score", selected.get("total_score") if selected.get("total_score") is not None else "-")
-    c3.metric("Factor Coverage", f"{float(selected.get('coverage_pct') or 0):.1f}%")
-    c4.metric("문항 Auto Coverage", f"{float(details.get('question_coverage_pct') or 0):.1f}%")
+    c3.metric("PER", f"{per_value:.2f}" if per_value is not None else "-")
+    c4.metric("PBR", f"{pbr_value:.2f}" if pbr_value is not None else "-")
+    c5.metric("Factor Coverage", f"{float(selected.get('coverage_pct') or 0):.1f}%")
+    c6.metric("문항 Auto Coverage", f"{float(details.get('question_coverage_pct') or 0):.1f}%")
 
     auto_count = int(details.get("auto_scored_question_count") or 0)
     qualitative_count = int(details.get("qualitative_question_count") or 0)
